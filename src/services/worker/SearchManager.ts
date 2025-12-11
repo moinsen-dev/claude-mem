@@ -197,7 +197,28 @@ export class SearchManager {
 
         const totalResults = observations.length + sessions.length + prompts.length;
 
+        // Log observation access for usage tracking (search_result access type)
+        if (observations.length > 0) {
+          try {
+            const observationIds = observations.map(obs => obs.id);
+            this.sessionStore.logObservationAccessBatch(observationIds, 'search_result');
+          } catch (logError) {
+            // Non-blocking: don't fail the search if logging fails
+            happy_path_error__with_fallback('[SearchManager] Failed to log search result access:', logError);
+          }
+        }
+
         if (totalResults === 0) {
+          // Return empty raw format for UI consumption
+          if (format === 'raw') {
+            return {
+              observations: [],
+              sessions: [],
+              prompts: [],
+              total: 0,
+              query
+            };
+          }
           return {
             content: [{
               type: 'text' as const,
@@ -230,6 +251,17 @@ export class SearchManager {
         const limitedResults = allResults.slice(0, options.limit || 20);
 
         // Format based on requested format
+        // format=raw returns JSON for UI consumption (not MCP text)
+        if (format === 'raw') {
+          return {
+            observations: limitedResults.filter(r => r.type === 'observation').map(r => r.data),
+            sessions: limitedResults.filter(r => r.type === 'session').map(r => r.data),
+            prompts: limitedResults.filter(r => r.type === 'prompt').map(r => r.data),
+            total: totalResults,
+            query
+          };
+        }
+
         let combinedText: string;
         if (format === 'index') {
           const header = `Found ${totalResults} result(s) matching "${query}" (${observations.length} obs, ${sessions.length} sessions, ${prompts.length} prompts):\n\n`;

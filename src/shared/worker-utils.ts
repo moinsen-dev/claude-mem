@@ -88,13 +88,23 @@ function findWorkerScript(): { script: string; cwd: string } | null {
 }
 
 /**
- * Find ecosystem config - checks marketplace first (canonical location)
+ * Find ecosystem config - checks cache first (has correct relative paths for cache structure)
+ * Returns both the config path and the directory (cwd) where PM2 should run from
  */
-function findEcosystemConfig(): string | null {
-  // Marketplace is canonical location for ecosystem config
+function findEcosystemConfig(): { configPath: string; cwd: string } | null {
+  // Check cache directory first - it has ecosystem config with correct paths for cache structure
+  const cacheDir = findLatestCacheDir();
+  if (cacheDir) {
+    const cacheEcosystem = path.join(cacheDir, 'ecosystem.config.cjs');
+    if (existsSync(cacheEcosystem)) {
+      return { configPath: cacheEcosystem, cwd: cacheDir };
+    }
+  }
+
+  // Fallback to marketplace (for development/direct installs)
   const marketplaceEcosystem = path.join(MARKETPLACE_ROOT, 'ecosystem.config.cjs');
   if (existsSync(marketplaceEcosystem)) {
-    return marketplaceEcosystem;
+    return { configPath: marketplaceEcosystem, cwd: MARKETPLACE_ROOT };
   }
   return null;
 }
@@ -173,9 +183,9 @@ async function startWorker(): Promise<boolean> {
       }
     } else {
       // On Unix, use PM2 for process management
-      const ecosystemPath = findEcosystemConfig();
+      const ecosystemInfo = findEcosystemConfig();
 
-      if (!ecosystemPath) {
+      if (!ecosystemInfo) {
         throw new Error('Ecosystem config not found');
       }
 
@@ -192,8 +202,11 @@ async function startWorker(): Promise<boolean> {
         );
       }
 
-      const result = spawnSync(pm2Info.command, ['start', ecosystemPath], {
-        cwd: pm2Info.cwd,
+      // IMPORTANT: Use ecosystem config's cwd, not pm2's cwd
+      // PM2 resolves relative script paths from cwd, and ecosystem config
+      // has paths relative to its own directory
+      const result = spawnSync(pm2Info.command, ['start', ecosystemInfo.configPath], {
+        cwd: ecosystemInfo.cwd,
         stdio: 'pipe',
         encoding: 'utf-8'
       });
@@ -246,13 +259,14 @@ export async function ensureWorkerRunning(): Promise<void> {
 
   if (!started) {
     const port = getWorkerPort();
-    const cacheDir = findLatestCacheDir();
-    const installDir = cacheDir || MARKETPLACE_ROOT;
+    const ecosystemInfo = findEcosystemConfig();
+    const installDir = ecosystemInfo?.cwd || findLatestCacheDir() || MARKETPLACE_ROOT;
+    const ecosystemPath = ecosystemInfo?.configPath || path.join(MARKETPLACE_ROOT, 'ecosystem.config.cjs');
     throw new Error(
       `Worker service failed to start on port ${port}.\n\n` +
       `To start manually, run:\n` +
       `  cd ${installDir}\n` +
-      `  npx pm2 start ${MARKETPLACE_ROOT}/ecosystem.config.cjs\n\n` +
+      `  npx pm2 start ${ecosystemPath}\n\n` +
       `If already running, try: npx pm2 restart claude-mem-worker`
     );
   }

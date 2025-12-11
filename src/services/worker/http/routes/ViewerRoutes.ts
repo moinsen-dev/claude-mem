@@ -7,7 +7,7 @@
 
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { getPackageRoot } from '../../../../shared/paths.js';
 import { SSEBroadcaster } from '../../SSEBroadcaster.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
@@ -23,7 +23,21 @@ export class ViewerRoutes extends BaseRouteHandler {
     super();
   }
 
+  /**
+   * Get the UI directory path (handles both cache and marketplace structures)
+   */
+  private getUiDir(): string {
+    const packageRoot = getPackageRoot();
+    const cacheUiDir = path.join(packageRoot, 'ui');
+    const marketplaceUiDir = path.join(packageRoot, 'plugin', 'ui');
+    return existsSync(cacheUiDir) ? cacheUiDir : marketplaceUiDir;
+  }
+
   setupRoutes(app: express.Application): void {
+    // Serve static files from ui directory (viewer-bundle.js, assets, etc.)
+    const uiDir = this.getUiDir();
+    app.use(express.static(uiDir));
+
     app.get('/health', this.handleHealth.bind(this));
     app.get('/', this.handleViewerUI.bind(this));
     app.get('/stream', this.handleSSEStream.bind(this));
@@ -40,8 +54,7 @@ export class ViewerRoutes extends BaseRouteHandler {
    * Serve viewer UI
    */
   private handleViewerUI = this.wrapHandler((req: Request, res: Response): void => {
-    const packageRoot = getPackageRoot();
-    const viewerPath = path.join(packageRoot, 'plugin', 'ui', 'viewer.html');
+    const viewerPath = path.join(this.getUiDir(), 'viewer.html');
     const html = readFileSync(viewerPath, 'utf-8');
     res.setHeader('Content-Type', 'text/html');
     res.send(html);

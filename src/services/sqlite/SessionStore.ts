@@ -40,6 +40,7 @@ export class SessionStore {
     this.makeObservationsTextNullable();
     this.createUserPromptsTable();
     this.ensureDiscoveryTokensColumn();
+    this.createObservationAccessTable();
   }
 
   /**
@@ -539,6 +540,223 @@ export class SessionStore {
     } catch (error: any) {
       console.error('[SessionStore] Discovery tokens migration error:', error.message);
       throw error; // Re-throw to prevent silent failures
+    }
+  }
+
+  /**
+   * Create observation_access table for usage tracking (migration 12)
+   * Tracks when observations are accessed via context injection, search, or manual view
+   */
+  private createObservationAccessTable(): void {
+    try {
+      // Check if migration already applied
+      const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(12) as SchemaVersion | undefined;
+      if (applied) return;
+
+      // Check if table already exists
+      const tableInfo = this.db.pragma('table_info(observation_access)') as TableColumnInfo[];
+      if (tableInfo.length > 0) {
+        // Already migrated
+        this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(12, new Date().toISOString());
+        return;
+      }
+
+      console.error('[SessionStore] Creating observation_access table for usage tracking...');
+
+      // Create the table
+      this.db.exec(`
+        CREATE TABLE observation_access (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          observation_id INTEGER NOT NULL,
+          access_type TEXT NOT NULL CHECK(access_type IN ('context_injection', 'search_result', 'manual_view')),
+          accessed_at TEXT NOT NULL,
+          accessed_at_epoch INTEGER NOT NULL,
+          sdk_session_id TEXT,
+          FOREIGN KEY(observation_id) REFERENCES observations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_observation_access_obs ON observation_access(observation_id);
+        CREATE INDEX idx_observation_access_epoch ON observation_access(accessed_at_epoch DESC);
+        CREATE INDEX idx_observation_access_type ON observation_access(access_type);
+      `);
+
+      // Record migration
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(12, new Date().toISOString());
+
+      console.error('[SessionStore] Successfully created observation_access table');
+    } catch (error: any) {
+      console.error('[SessionStore] Migration error (create observation_access table):', error.message);
+    }
+  }
+
+  // ===== Usage Tracking Methods =====
+
+  /**
+   * Log an observation access event
+   */
+  logObservationAccess(
+    observationId: number,
+    accessType: 'context_injection' | 'search_result' | 'manual_view',
+    sdkSessionId?: string
+  ): void {
+    try {
+      const now = new Date();
+      const stmt = this.db.prepare(`
+        INSERT INTO observation_access (observation_id, access_type, accessed_at, accessed_at_epoch, sdk_session_id)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      stmt.run(observationId, accessType, now.toISOString(), Math.floor(now.getTime() / 1000), sdkSessionId || null);
+    } catch (error: any) {
+      // Log but don't throw - usage tracking shouldn't break core functionality
+      console.error('[SessionStore] Failed to log observation access:', error.message);
+    }
+  }
+
+  /**
+   * Log multiple observation accesses in a batch (more efficient for context injection)
+   */
+  logObservationAccessBatch(
+    observationIds: number[],
+    accessType: 'context_injection' | 'search_result' | 'manual_view',
+    sdkSessionId?: string
+  ): void {
+    if (observationIds.length === 0) return;
+
+    try {
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const nowEpoch = Math.floor(now.getTime() / 1000);
+
+      const stmt = this.db.prepare(`
+        INSERT INTO observation_access (observation_id, access_type, accessed_at, accessed_at_epoch, sdk_session_id)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+
+      const insertMany = this.db.transaction((ids: number[]) => {
+        for (const id of ids) {
+          stmt.run(id, accessType, nowIso, nowEpoch, sdkSessionId || null);
+        }
+      });
+
+      insertMany(observationIds);
+    } catch (error: any) {
+      console.error('[SessionStore] Failed to log observation access batch:', error.message);
+    }
+  }
+
+  /**
+   * Get usage statistics for a single observation
+   */
+  getObservationUsageStats(observationId: number): {
+    totalAccesses: number;
+    byType: Record<string, number>;
+    lastAccessed: string | null;
+  } {
+    try {
+      // Get total and breakdown by type
+      const byTypeStmt = this.db.prepare(`
+        SELECT access_type, COUNT(*) as count
+        FROM observation_access
+        WHERE observation_id = ?
+        GROUP BY access_type
+      `);
+      const byTypeRows = byTypeStmt.all(observationId) as Array<{ access_type: string; count: number }>;
+
+      const byType: Record<string, number> = {};
+      let totalAccesses = 0;
+      for (const row of byTypeRows) {
+        byType[row.access_type] = row.count;
+        totalAccesses += row.count;
+      }
+
+      // Get last accessed timestamp
+      const lastAccessedStmt = this.db.prepare(`
+        SELECT accessed_at
+        FROM observation_access
+        WHERE observation_id = ?
+        ORDER BY accessed_at_epoch DESC
+        LIMIT 1
+      `);
+      const lastRow = lastAccessedStmt.get(observationId) as { accessed_at: string } | undefined;
+
+      return {
+        totalAccesses,
+        byType,
+        lastAccessed: lastRow?.accessed_at || null
+      };
+    } catch (error: any) {
+      console.error('[SessionStore] Failed to get observation usage stats:', error.message);
+      return { totalAccesses: 0, byType: {}, lastAccessed: null };
+    }
+  }
+
+  /**
+   * Get most used observations with their usage counts
+   */
+  getMostUsedObservations(limit: number = 50, project?: string): Array<{
+    id: number;
+    title: string | null;
+    subtitle: string | null;
+    type: string;
+    project: string;
+    usageCount: number;
+    lastAccessed: string;
+    created_at_epoch: number;
+  }> {
+    try {
+      const sql = project
+        ? `
+          SELECT
+            o.id, o.title, o.subtitle, o.type, o.project, o.created_at_epoch,
+            COUNT(oa.id) as usageCount,
+            MAX(oa.accessed_at) as lastAccessed
+          FROM observations o
+          LEFT JOIN observation_access oa ON o.id = oa.observation_id
+          WHERE o.project = ?
+          GROUP BY o.id
+          ORDER BY usageCount DESC, o.created_at_epoch DESC
+          LIMIT ?
+        `
+        : `
+          SELECT
+            o.id, o.title, o.subtitle, o.type, o.project, o.created_at_epoch,
+            COUNT(oa.id) as usageCount,
+            MAX(oa.accessed_at) as lastAccessed
+          FROM observations o
+          LEFT JOIN observation_access oa ON o.id = oa.observation_id
+          GROUP BY o.id
+          ORDER BY usageCount DESC, o.created_at_epoch DESC
+          LIMIT ?
+        `;
+
+      const stmt = this.db.prepare(sql);
+      return project ? stmt.all(project, limit) : stmt.all(limit);
+    } catch (error: any) {
+      console.error('[SessionStore] Failed to get most used observations:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get usage timeline for an observation
+   */
+  getObservationUsageTimeline(observationId: number, limit: number = 20): Array<{
+    accessed_at: string;
+    access_type: string;
+    sdk_session_id: string | null;
+  }> {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT accessed_at, access_type, sdk_session_id
+        FROM observation_access
+        WHERE observation_id = ?
+        ORDER BY accessed_at_epoch DESC
+        LIMIT ?
+      `);
+      return stmt.all(observationId, limit);
+    } catch (error: any) {
+      console.error('[SessionStore] Failed to get observation usage timeline:', error.message);
+      return [];
     }
   }
 

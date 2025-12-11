@@ -57,6 +57,8 @@ import { SessionRoutes } from './worker/http/routes/SessionRoutes.js';
 import { DataRoutes } from './worker/http/routes/DataRoutes.js';
 import { SearchRoutes } from './worker/http/routes/SearchRoutes.js';
 import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
+import { GraphRoutes } from './worker/http/routes/GraphRoutes.js';
+import { GraphService } from './worker/GraphService.js';
 
 export class WorkerService {
   private app: express.Application;
@@ -79,6 +81,7 @@ export class WorkerService {
   private dataRoutes: DataRoutes;
   private searchRoutes: SearchRoutes | null;
   private settingsRoutes: SettingsRoutes;
+  private graphRoutes: GraphRoutes | null;
 
   constructor() {
     this.app = express();
@@ -107,8 +110,9 @@ export class WorkerService {
     this.viewerRoutes = new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager);
     this.sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.sessionEventBroadcaster, this);
     this.dataRoutes = new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime);
-    // SearchRoutes needs SearchManager which requires initialized DB - will be created in initializeBackground()
+    // SearchRoutes and GraphRoutes need initialized DB - will be created in initializeBackground()
     this.searchRoutes = null;
+    this.graphRoutes = null;
     this.settingsRoutes = new SettingsRoutes(this.settingsManager);
 
     this.setupMiddleware();
@@ -178,7 +182,12 @@ export class WorkerService {
     );
     this.searchRoutes = new SearchRoutes(searchManager);
     this.searchRoutes.setupRoutes(this.app); // Setup search routes now that SearchManager is ready
-    logger.info('WORKER', 'SearchManager initialized and search routes registered');
+
+    // Initialize graph services (requires initialized database)
+    const graphService = new GraphService(this.dbManager.getSessionStore());
+    this.graphRoutes = new GraphRoutes(graphService);
+    this.graphRoutes.setupRoutes(this.app);
+    logger.info('WORKER', 'SearchManager and GraphService initialized, routes registered');
 
     // Connect to MCP server
     const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');

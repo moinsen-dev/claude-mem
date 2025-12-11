@@ -101,10 +101,20 @@ export function getCurrentProjectName(): string {
 /**
  * Find package root directory
  *
- * Works because bundled hooks are in plugin/scripts/,
- * so package root is always two levels up
+ * Handles both marketplace and cache directory structures:
+ * - Marketplace: plugin/scripts/worker.cjs → 2 levels up → marketplace root
+ * - Cache: 7.0.10/scripts/worker.cjs → 1 level up → cache version root
  */
 export function getPackageRoot(): string {
+  // Check if we're in cache structure (parent dir is version number like 7.0.10)
+  const oneUp = join(_dirname, '..');
+  const parentDirName = basename(oneUp);
+
+  // If parent looks like a version number, we're in cache structure (1 level up)
+  // Otherwise we're in marketplace structure (2 levels up to get past 'plugin')
+  if (/^\d+\.\d+\.\d+$/.test(parentDirName)) {
+    return oneUp;
+  }
   return join(_dirname, '..', '..');
 }
 
