@@ -69,7 +69,8 @@ async function buildHooks() {
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
       dependencies: {
-        'better-sqlite3': packageJson.dependencies['better-sqlite3']
+        'better-sqlite3': packageJson.dependencies['better-sqlite3'],
+        'pm2': packageJson.dependencies['pm2']
       },
       engines: {
         node: '>=18.0.0'

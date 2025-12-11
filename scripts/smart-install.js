@@ -4,6 +4,8 @@
  * Smart Install Script for claude-mem
  *
  * Features:
+ * - Context-aware: detects if running from cache or marketplace directory
+ * - Installs dependencies where package.json exists
  * - Only runs npm install when necessary (version change or missing deps)
  * - Caches installation state with version marker
  * - Provides helpful Windows-specific error messages
@@ -12,19 +14,40 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'fs';
-import { execSync, spawnSync, spawn } from 'child_process';
-import { join } from 'path';
+import { execSync } from 'child_process';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 
+// Determine the directory where THIS script is running from
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SCRIPT_ROOT = dirname(__dirname); // Parent of scripts/ directory
 
-// CRITICAL: Always use marketplace directory for npm install and PM2/ecosystem
-// This script may run from cache directory (plugin/) which has no package.json
-// The marketplace root is the canonical location with package.json and node_modules
+// Detect if running from cache directory (has version number in path)
+const CACHE_PATTERN = /[/\\]cache[/\\]thedotmack[/\\]claude-mem[/\\]\d+\.\d+\.\d+/;
+const IS_RUNNING_FROM_CACHE = CACHE_PATTERN.test(__dirname);
+
+// Marketplace directory (always the same)
 const MARKETPLACE_ROOT = join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
-const PACKAGE_JSON_PATH = join(MARKETPLACE_ROOT, 'package.json');
-const VERSION_MARKER_PATH = join(MARKETPLACE_ROOT, '.install-version');
-const NODE_MODULES_PATH = join(MARKETPLACE_ROOT, 'node_modules');
+
+// Determine PLUGIN_ROOT based on where package.json exists
+// Priority: 1) Cache directory (if running from there and has package.json)
+//           2) Marketplace directory (fallback)
+function determinePluginRoot() {
+  if (IS_RUNNING_FROM_CACHE) {
+    const cachePackageJson = join(SCRIPT_ROOT, 'package.json');
+    if (existsSync(cachePackageJson)) {
+      return SCRIPT_ROOT;
+    }
+  }
+  return MARKETPLACE_ROOT;
+}
+
+const PLUGIN_ROOT = determinePluginRoot();
+const PACKAGE_JSON_PATH = join(PLUGIN_ROOT, 'package.json');
+const VERSION_MARKER_PATH = join(PLUGIN_ROOT, '.install-version');
+const NODE_MODULES_PATH = join(PLUGIN_ROOT, 'node_modules');
 const BETTER_SQLITE3_PATH = join(NODE_MODULES_PATH, 'better-sqlite3');
 
 // Colors for output
@@ -151,9 +174,8 @@ async function verifyNativeModules() {
   try {
     log('🔍 Verifying native modules...', colors.dim);
 
-    // CRITICAL: Use createRequire() to resolve from MARKETPLACE_ROOT
-    // This script may run from cache but must load modules from marketplace's node_modules
-    const require = createRequire(join(MARKETPLACE_ROOT, 'package.json'));
+    // Use createRequire() to resolve from PLUGIN_ROOT's node_modules
+    const require = createRequire(join(PLUGIN_ROOT, 'package.json'));
     const Database = require('better-sqlite3');
 
     // Try to create a test in-memory database
@@ -243,7 +265,8 @@ async function runNpmInstall() {
   const isWindows = process.platform === 'win32';
 
   log('', colors.cyan);
-  log('🔨 Installing dependencies...', colors.bright);
+  log(`🔨 Installing dependencies in ${IS_RUNNING_FROM_CACHE ? 'cache' : 'marketplace'}...`, colors.bright);
+  log(`   ${PLUGIN_ROOT}`, colors.dim);
   log('', colors.reset);
 
   // Try normal install first, then retry with force if it fails
@@ -258,12 +281,11 @@ async function runNpmInstall() {
     try {
       log(`Attempting install ${label}...`, colors.dim);
 
-      // Run npm install silently
+      // Run npm install silently in PLUGIN_ROOT (where package.json exists)
       execSync(command, {
-        cwd: MARKETPLACE_ROOT,
+        cwd: PLUGIN_ROOT,
         stdio: 'pipe', // Silent output unless error
         encoding: 'utf-8',
-        windowsHide: true,
       });
 
       // Verify better-sqlite3 was installed
@@ -338,6 +360,21 @@ function shouldFailOnWorkerStartup(workerStarted) {
 
 async function main() {
   try {
+    // Log execution context for debugging
+    if (IS_RUNNING_FROM_CACHE) {
+      log('📍 Running from cache directory', colors.dim);
+    } else {
+      log('📍 Running from marketplace directory', colors.dim);
+    }
+    log(`   Plugin root: ${PLUGIN_ROOT}`, colors.dim);
+
+    // Check if package.json exists (required for npm install)
+    if (!existsSync(PACKAGE_JSON_PATH)) {
+      log(`⚠️  No package.json found at ${PLUGIN_ROOT}`, colors.yellow);
+      log('   Dependencies cannot be installed without package.json', colors.dim);
+      process.exit(1);
+    }
+
     // Check if we need to install dependencies
     const installNeeded = needsInstall();
 

@@ -1,14 +1,103 @@
 import path from "path";
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { homedir } from "os";
 import { spawnSync } from "child_process";
 import { SettingsDefaultsManager } from "./SettingsDefaultsManager.js";
 import { logger } from "../utils/logger.js";
 import { HOOK_TIMEOUTS, getTimeout } from "./hook-constants.js";
 
-// CRITICAL: Always use marketplace directory for PM2/ecosystem
-// This ensures cross-platform compatibility and avoids cache directory confusion
+// Directory paths
 const MARKETPLACE_ROOT = path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
+const CACHE_BASE = path.join(homedir(), '.claude', 'plugins', 'cache', 'thedotmack', 'claude-mem');
+
+/**
+ * Find the cache directory with the highest version number
+ * Cache directories are named like: ~/.claude/plugins/cache/thedotmack/claude-mem/7.0.10/
+ */
+function findLatestCacheDir(): string | null {
+  try {
+    if (!existsSync(CACHE_BASE)) {
+      return null;
+    }
+    const versions = readdirSync(CACHE_BASE)
+      .filter(name => /^\d+\.\d+\.\d+$/.test(name))
+      .sort((a, b) => {
+        const [aMajor, aMinor, aPatch] = a.split('.').map(Number);
+        const [bMajor, bMinor, bPatch] = b.split('.').map(Number);
+        if (aMajor !== bMajor) return bMajor - aMajor;
+        if (aMinor !== bMinor) return bMinor - aMinor;
+        return bPatch - aPatch;
+      });
+    return versions.length > 0 ? path.join(CACHE_BASE, versions[0]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find PM2 executable - checks cache directory first, then marketplace, then global
+ */
+function findPm2(): { command: string; cwd: string } | null {
+  // Check cache directory first (most likely location for marketplace installs)
+  const cacheDir = findLatestCacheDir();
+  if (cacheDir) {
+    const cachePm2 = path.join(cacheDir, 'node_modules', '.bin', 'pm2');
+    if (existsSync(cachePm2)) {
+      return { command: cachePm2, cwd: cacheDir };
+    }
+  }
+
+  // Check marketplace directory
+  const marketplacePm2 = path.join(MARKETPLACE_ROOT, 'node_modules', '.bin', 'pm2');
+  if (existsSync(marketplacePm2)) {
+    return { command: marketplacePm2, cwd: MARKETPLACE_ROOT };
+  }
+
+  // Check global PM2
+  const globalPm2Check = spawnSync('which', ['pm2'], {
+    encoding: 'utf-8',
+    stdio: 'pipe'
+  });
+  if (globalPm2Check.status === 0) {
+    return { command: 'pm2', cwd: MARKETPLACE_ROOT };
+  }
+
+  return null;
+}
+
+/**
+ * Find worker script - checks cache directory first, then marketplace
+ */
+function findWorkerScript(): { script: string; cwd: string } | null {
+  // Check cache directory first
+  const cacheDir = findLatestCacheDir();
+  if (cacheDir) {
+    const cacheWorker = path.join(cacheDir, 'scripts', 'worker-service.cjs');
+    if (existsSync(cacheWorker)) {
+      return { script: cacheWorker, cwd: cacheDir };
+    }
+  }
+
+  // Check marketplace directory
+  const marketplaceWorker = path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'worker-service.cjs');
+  if (existsSync(marketplaceWorker)) {
+    return { script: marketplaceWorker, cwd: MARKETPLACE_ROOT };
+  }
+
+  return null;
+}
+
+/**
+ * Find ecosystem config - checks marketplace first (canonical location)
+ */
+function findEcosystemConfig(): string | null {
+  // Marketplace is canonical location for ecosystem config
+  const marketplaceEcosystem = path.join(MARKETPLACE_ROOT, 'ecosystem.config.cjs');
+  if (existsSync(marketplaceEcosystem)) {
+    return marketplaceEcosystem;
+  }
+  return null;
+}
 
 // Named constants for health checks
 // Windows needs longer timeouts due to startup overhead
@@ -52,18 +141,20 @@ async function isWorkerHealthy(): Promise<boolean> {
  */
 async function startWorker(): Promise<boolean> {
   try {
-    const workerScript = path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'worker-service.cjs');
-
-    if (!existsSync(workerScript)) {
-      throw new Error(`Worker script not found at ${workerScript}`);
+    // Find worker script (checks cache first, then marketplace)
+    const workerInfo = findWorkerScript();
+    if (!workerInfo) {
+      throw new Error('Worker script not found in cache or marketplace directory');
     }
+
+    const { script: workerScript, cwd: workerCwd } = workerInfo;
 
     if (process.platform === 'win32') {
       // On Windows, use PowerShell Start-Process with -WindowStyle Hidden
       // This avoids visible console windows that PM2 creates on Windows
       // Escape single quotes for PowerShell by doubling them
       const escapedScript = workerScript.replace(/'/g, "''");
-      const escapedWorkingDir = MARKETPLACE_ROOT.replace(/'/g, "''");
+      const escapedWorkingDir = workerCwd.replace(/'/g, "''");
 
       const result = spawnSync('powershell.exe', [
         '-NoProfile',
@@ -71,7 +162,7 @@ async function startWorker(): Promise<boolean> {
         '-Command',
         `Start-Process -FilePath 'node' -ArgumentList '${escapedScript}' -WorkingDirectory '${escapedWorkingDir}' -WindowStyle Hidden`
       ], {
-        cwd: MARKETPLACE_ROOT,
+        cwd: workerCwd,
         stdio: 'pipe',
         encoding: 'utf-8',
         windowsHide: true
@@ -82,38 +173,27 @@ async function startWorker(): Promise<boolean> {
       }
     } else {
       // On Unix, use PM2 for process management
-      const ecosystemPath = path.join(MARKETPLACE_ROOT, 'ecosystem.config.cjs');
+      const ecosystemPath = findEcosystemConfig();
 
-      if (!existsSync(ecosystemPath)) {
-        throw new Error(`Ecosystem config not found at ${ecosystemPath}`);
+      if (!ecosystemPath) {
+        throw new Error('Ecosystem config not found');
       }
 
-      const localPm2Base = path.join(MARKETPLACE_ROOT, 'node_modules', '.bin', 'pm2');
-      let pm2Command: string;
+      // Find PM2 (checks cache first, then marketplace, then global)
+      const pm2Info = findPm2();
 
-      if (existsSync(localPm2Base)) {
-        pm2Command = localPm2Base;
-      } else {
-        // Check if global pm2 exists
-        const globalPm2Check = spawnSync('which', ['pm2'], {
-          encoding: 'utf-8',
-          stdio: 'pipe'
-        });
-
-        if (globalPm2Check.status !== 0) {
-          throw new Error(
-            'PM2 not found. Install it locally with:\n' +
-            `  cd ${MARKETPLACE_ROOT}\n` +
-            '  npm install\n\n' +
-            'Or install globally with: npm install -g pm2'
-          );
-        }
-
-        pm2Command = 'pm2';
+      if (!pm2Info) {
+        const cacheDir = findLatestCacheDir();
+        throw new Error(
+          'PM2 not found. Install it locally with:\n' +
+          `  cd ${cacheDir || MARKETPLACE_ROOT}\n` +
+          '  npm install\n\n' +
+          'Or install globally with: npm install -g pm2'
+        );
       }
 
-      const result = spawnSync(pm2Command, ['start', ecosystemPath], {
-        cwd: MARKETPLACE_ROOT,
+      const result = spawnSync(pm2Info.command, ['start', ecosystemPath], {
+        cwd: pm2Info.cwd,
         stdio: 'pipe',
         encoding: 'utf-8'
       });
@@ -133,10 +213,12 @@ async function startWorker(): Promise<boolean> {
 
     return false;
   } catch (error) {
+    const workerInfo = findWorkerScript();
     logger.error('SYSTEM', 'Failed to start worker', {
       platform: process.platform,
-      workerScript: path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'worker-service.cjs'),
+      workerScript: workerInfo?.script || 'not found',
       error: error instanceof Error ? error.message : String(error),
+      cacheDir: findLatestCacheDir(),
       marketplaceRoot: MARKETPLACE_ROOT
     });
     return false;
@@ -164,11 +246,13 @@ export async function ensureWorkerRunning(): Promise<void> {
 
   if (!started) {
     const port = getWorkerPort();
+    const cacheDir = findLatestCacheDir();
+    const installDir = cacheDir || MARKETPLACE_ROOT;
     throw new Error(
       `Worker service failed to start on port ${port}.\n\n` +
       `To start manually, run:\n` +
-      `  cd ${MARKETPLACE_ROOT}\n` +
-      `  npx pm2 start ecosystem.config.cjs\n\n` +
+      `  cd ${installDir}\n` +
+      `  npx pm2 start ${MARKETPLACE_ROOT}/ecosystem.config.cjs\n\n` +
       `If already running, try: npx pm2 restart claude-mem-worker`
     );
   }
