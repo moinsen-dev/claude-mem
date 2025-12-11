@@ -383,6 +383,79 @@ If you're experiencing issues, describe the problem to Claude and the troublesho
 - Database issues → `sqlite3 ~/.claude-mem/claude-mem.db "PRAGMA integrity_check;"`
 - Search not working → Check FTS5 tables exist
 
+### VSCode Extension Hook Issue
+
+**Problem:** When using Claude Code via the VSCode extension, plugin hooks may not trigger automatically due to a known bug in the VSCode plugin system. This means observations aren't captured during sessions.
+
+**Symptoms:**
+- No new observations appearing in the viewer (http://localhost:37777)
+- Silent.log shows no hook activity
+- Context not being injected at session start
+
+**Workaround:** Add hooks directly to your global Claude settings file (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/plugins/cache/thedotmack/claude-mem/<VERSION>/scripts/new-hook.js",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/plugins/cache/thedotmack/claude-mem/<VERSION>/scripts/save-hook.js",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/plugins/cache/thedotmack/claude-mem/<VERSION>/scripts/summary-hook.js",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Important:** Replace `<VERSION>` with your installed version (e.g., `7.0.10`). You can find this by running:
+
+```bash
+ls ~/.claude/plugins/cache/thedotmack/claude-mem/
+```
+
+**Note:** When you update claude-mem to a new version, you'll need to update the version number in these paths.
+
+**Verify hooks are working:**
+
+```bash
+# Check for recent hook activity
+tail -20 ~/.claude-mem/silent.log
+
+# Check worker status
+pm2 list
+
+# Check observations are being captured
+curl -s 'http://localhost:37777/api/stats' | jq '.database.observations'
+```
+
 See [Troubleshooting Guide](https://docs.claude-mem.ai/troubleshooting) for complete solutions.
 
 ---

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [7.0.11] - 2025-12-11
+
+### Documentation
+
+- Added VSCode Extension Hook Issue workaround to README troubleshooting section
+- Documented manual hook configuration for users experiencing plugin hook trigger bug in VSCode
+
+### UI Improvements
+
+- Made project name badge more prominent with yellow/amber border and background styling
+- Project badge now uses bold text, padding, and rounded corners for better visibility
+
 ## [7.0.9] - 2025-12-10
 
 ## Bug Fixes
