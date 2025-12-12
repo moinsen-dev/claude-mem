@@ -17,6 +17,7 @@ import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { happy_path_error__with_fallback } from '../utils/silent-debug.js';
 import { handleWorkerError } from '../shared/hook-error-handler.js';
 import { extractLastMessage } from '../shared/transcript-parser.js';
+import { detectQuestion, mightBeQuestion } from '../utils/question-detector.js';
 
 export interface StopInput {
   session_id: string;
@@ -53,6 +54,36 @@ async function summaryHook(input?: StopInput): Promise<void> {
     hasLastUserMessage: !!lastUserMessage,
     hasLastAssistantMessage: !!lastAssistantMessage
   });
+
+  // Check if assistant message might be a question (for Slack notifications)
+  // Do quick pre-check before expensive full analysis
+  if (lastAssistantMessage && mightBeQuestion(lastAssistantMessage)) {
+    const questionResult = detectQuestion(lastAssistantMessage);
+
+    if (questionResult.isQuestion && questionResult.confidence !== 'low') {
+      logger.info('HOOK', 'Question detected, notifying worker', {
+        confidence: questionResult.confidence,
+        hasExtractedQuestion: !!questionResult.extractedQuestion
+      });
+
+      // Fire-and-forget notification to worker (don't block summary)
+      fetch(`http://127.0.0.1:${port}/api/sessions/waiting`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          claudeSessionId: session_id,
+          project: input.cwd.split('/').pop() || 'unknown',
+          cwd: input.cwd,
+          question: questionResult.extractedQuestion,
+          fullMessage: lastAssistantMessage,
+          transcriptPath: transcriptPath
+        }),
+        signal: AbortSignal.timeout(5000)
+      }).catch((error: any) => {
+        logger.warn('HOOK', 'Failed to notify waiting session', { error: error.message });
+      });
+    }
+  }
 
   try {
     // Send to worker - worker handles privacy check and database operations
