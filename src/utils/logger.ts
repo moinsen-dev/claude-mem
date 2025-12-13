@@ -1,8 +1,15 @@
 /**
  * Structured Logger for claude-mem Worker Service
  * Provides readable, traceable logging with correlation IDs and data flow tracking
+ *
+ * Features:
+ * - Console output with structured formatting
+ * - Optional database sink for self-aware logging
+ * - Error pattern detection and tracking
+ * - Buffered writes for performance
  */
 
+import { createHash } from 'crypto';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 
 export enum LogLevel {
@@ -13,7 +20,7 @@ export enum LogLevel {
   SILENT = 4
 }
 
-export type Component = 'HOOK' | 'WORKER' | 'SDK' | 'PARSER' | 'DB' | 'SYSTEM' | 'HTTP' | 'SESSION' | 'CHROMA';
+export type Component = 'HOOK' | 'WORKER' | 'SDK' | 'PARSER' | 'DB' | 'SYSTEM' | 'HTTP' | 'SESSION' | 'CHROMA' | 'GRAPH' | 'SLACK' | 'NOTIFICATIONS' | 'HEALTH';
 
 interface LogContext {
   sessionId?: number;
@@ -22,13 +29,101 @@ interface LogContext {
   [key: string]: any;
 }
 
+interface LogEntry {
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+  component: string;
+  message: string;
+  context?: Record<string, any>;
+  data?: any;
+  errorStack?: string;
+  timestamp: Date;
+}
+
+/**
+ * Interface for database sink - allows lazy injection to avoid circular dependencies
+ */
+interface DatabaseSink {
+  storeSystemLog(
+    level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR',
+    component: string,
+    message: string,
+    context?: Record<string, any>,
+    data?: any,
+    errorStack?: string
+  ): number;
+  storeSystemLogBatch(logs: LogEntry[]): number;
+  trackErrorPattern(errorHash: string, errorMessage: string, component: string): { id: number; isNew: boolean; occurrenceCount: number };
+}
+
 class Logger {
   private level: LogLevel | null = null;
   private useColor: boolean;
+  private dbSink: DatabaseSink | null = null;
+  private logBuffer: LogEntry[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+  private readonly bufferSize = 50;          // Flush after 50 logs
+  private readonly flushIntervalMs = 5000;   // Or flush every 5 seconds
+  private isInitialized = false;
 
   constructor() {
     // Disable colors when output is not a TTY (e.g., PM2 logs)
     this.useColor = process.stdout.isTTY ?? false;
+  }
+
+  /**
+   * Initialize database sink for persistent logging
+   * Called by worker service after SessionStore is ready
+   */
+  initializeDatabaseSink(sink: DatabaseSink): void {
+    if (this.isInitialized) return;
+    this.dbSink = sink;
+    this.isInitialized = true;
+
+    // Start flush timer
+    this.flushTimer = setInterval(() => this.flushBuffer(), this.flushIntervalMs);
+
+    // Flush on process exit
+    process.on('beforeExit', () => this.flushBuffer());
+    process.on('SIGINT', () => { this.flushBuffer(); process.exit(0); });
+    process.on('SIGTERM', () => { this.flushBuffer(); process.exit(0); });
+  }
+
+  /**
+   * Check if database logging is enabled
+   */
+  get isDatabaseLoggingEnabled(): boolean {
+    return this.dbSink !== null;
+  }
+
+  /**
+   * Flush buffered logs to database
+   */
+  private flushBuffer(): void {
+    if (this.logBuffer.length === 0 || !this.dbSink) return;
+
+    const logsToFlush = [...this.logBuffer];
+    this.logBuffer = [];
+
+    try {
+      this.dbSink.storeSystemLogBatch(logsToFlush);
+    } catch (error) {
+      // Silently fail - we can't log this error without recursion
+      console.error('[Logger] Failed to flush logs to database');
+    }
+  }
+
+  /**
+   * Create a hash for error pattern detection
+   */
+  private createErrorHash(message: string, component: string): string {
+    // Normalize the message: remove timestamps, IDs, file paths
+    const normalized = message
+      .replace(/\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}/g, 'TIMESTAMP')
+      .replace(/\b\d+\b/g, 'NUM')
+      .replace(/\/[\w\/.-]+/g, 'PATH')
+      .substring(0, 200);  // Limit length
+
+    return createHash('md5').update(`${component}:${normalized}`).digest('hex').substring(0, 16);
   }
 
   /**
@@ -143,7 +238,8 @@ class Logger {
   ): void {
     if (level < this.getLevel()) return;
 
-    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 23);
+    const now = new Date();
+    const timestamp = now.toISOString().replace('T', ' ').substring(0, 23);
     const levelStr = LogLevel[level].padEnd(5);
     const componentStr = component.padEnd(6);
 
@@ -183,6 +279,43 @@ class Logger {
       console.error(logLine);
     } else {
       console.log(logLine);
+    }
+
+    // Write to database if enabled (skip DEBUG level for database to reduce noise)
+    if (this.dbSink && level >= LogLevel.INFO) {
+      const levelName = LogLevel[level] as 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+
+      // Extract error stack if data is an Error
+      let errorStack: string | undefined;
+      if (data instanceof Error) {
+        errorStack = data.stack;
+      }
+
+      // Add to buffer
+      this.logBuffer.push({
+        level: levelName,
+        component,
+        message,
+        context: context ? { ...context } : undefined,
+        data: data instanceof Error ? { message: data.message, name: data.name } : data,
+        errorStack,
+        timestamp: now
+      });
+
+      // Track error patterns
+      if (level === LogLevel.ERROR && this.dbSink) {
+        const errorHash = this.createErrorHash(message, component);
+        try {
+          this.dbSink.trackErrorPattern(errorHash, message, component);
+        } catch {
+          // Silently fail pattern tracking
+        }
+      }
+
+      // Flush if buffer is full
+      if (this.logBuffer.length >= this.bufferSize) {
+        this.flushBuffer();
+      }
     }
   }
 
